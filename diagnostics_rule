@@ -1,0 +1,58 @@
+"""
+Rule activation diagnostics for the adapted rules on X-n351-k40
+(matched conditions: ls_prob=0, stagnation_limit=None, H=20000).
+
+Needs alns_evrp.py, alns_faithful.py and the instance files in /content.
+~11 minutes per run per method.
+
+    !python run_rule_counts.py
+
+Checks that the instrumented class reproduces your 'adapted' costs, then prints
+for each seed: rule_counts (R1/R2/R3/roulette), max_no_improve, threshold,
+and the operator usage. Set WITH_BASELINE = True to also get the baseline
+operator usage on the same seeds (doubles the time).
+"""
+import json
+
+from alns_evrp import (ALNS, EVRPSimulator, parse_evrp_instance,
+                       build_instances_dict, verify_solution)
+from alns_faithful import ALNSAdaptedLogged
+
+INSTANCE = "X-n214-k11"
+H = 20000
+# costs of your existing 'adapted' runs (matched family), to validate equivalence
+EXPECTED = {100: 14132.29, 200: 14435.49, 300: 13894.64}
+WITH_BASELINE = False
+OUT = "rule_counts_X214.json"
+
+raw, bks = build_instances_dict([INSTANCE], "/content/")[INSTANCE]
+instance = parse_evrp_instance(raw, published_bks=bks, verbose=False)
+sim = EVRPSimulator(instance)
+common = dict(max_iterations=H, verbose=False, ls_prob=0.0,
+              stagnation_limit=None)
+
+out = []
+for seed, expected in EXPECTED.items():
+    a = ALNSAdaptedLogged(instance, sim, seed=seed, **common)
+    b, h, bt, tt, sol = a.solve()
+    ok = bool(sol) and bool(verify_solution(instance, sim, sol)[0])
+    total_sel = sum(a.rule_counts.values())
+    row = {"seed": seed, "cost": round(b, 2), "expected": expected,
+           "same_as_existing": abs(b - expected) < 0.01, "feasible": ok,
+           "rule_counts": a.rule_counts,
+           "share": {k: round(v / max(total_sel, 1), 3)
+                     for k, v in a.rule_counts.items()},
+           "max_no_improve": a.max_no_improve,
+           "stagn_thresh": a._stagn_thresh,
+           "op_dist_adapted": {k: round(v, 1) for k, v in
+                               a.get_operator_distribution().items()},
+           "time_s": round(tt, 1)}
+    if WITH_BASELINE:
+        base = ALNS(instance, sim, seed=seed, use_rules=False, **common)
+        base.solve()
+        row["op_dist_baseline"] = {k: round(v, 1) for k, v in
+                                   base.get_operator_distribution().items()}
+    print(json.dumps(row))
+    out.append(row)
+    json.dump(out, open(OUT, "w"), indent=1)
+print("saved", OUT)
