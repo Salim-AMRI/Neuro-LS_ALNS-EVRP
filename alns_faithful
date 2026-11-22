@@ -1,0 +1,50 @@
+
+%%writefile alns_faithful.py
+import random
+import numpy as np
+from alns_evrp import ALNS
+
+
+class ALNSAdaptedLogged(ALNS):
+    """Identique à ALNS(use_rules=True), avec compteurs d'activation."""
+    def __init__(self, *args, **kwargs):
+        kwargs["use_rules"] = True
+        super().__init__(*args, **kwargs)
+        self.rule_counts = {"R3": 0, "R2": 0, "R1": 0, "roulette": 0}
+        self.max_no_improve = 0
+
+    def _select_destroy_rules(self, destroy_ops):
+        names = list(destroy_ops.keys())
+        avgs = {op: (float(np.mean(self.stats['destroy'][op]['gains']))
+                     if self.stats['destroy'][op]['gains'] else 0.0)
+                for op in names}
+        improving = [op for op in names if avgs[op] > 0]
+        self.max_no_improve = max(self.max_no_improve, self._no_improve)
+
+        v = self.rules_variant
+        use_r1 = "R1" in v
+        use_r2 = "R2" in v
+        use_r3 = "R3" in v
+
+        if use_r3 and self._post_jump > 0:
+            self._post_jump -= 1
+            self.rule_counts["R3"] += 1
+            if improving:
+                improving.sort(key=lambda op: avgs[op])
+                return improving[0]
+            return random.choice(names)
+
+        if use_r2 and self._no_improve >= self._stagn_thresh:
+            worst = min(names, key=lambda op: avgs[op])
+            if use_r3:
+                self._post_jump = 3
+            self.rule_counts["R2"] += 1
+            return worst
+
+        if use_r1 and len(improving) >= 2:
+            improving.sort(key=lambda op: avgs[op])
+            self.rule_counts["R1"] += 1
+            return improving[len(improving) // 2]
+
+        self.rule_counts["roulette"] += 1
+        return self._roulette(self._w_d)
