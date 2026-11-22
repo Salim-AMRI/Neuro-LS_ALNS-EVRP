@@ -1,0 +1,131 @@
+"""
+Clean control of the choice made by R1.
+
+All variants use EXACTLY the structure of R1: if at least two destroy operators
+have a positive recent mean gain (set I), choose inside I according to `choice`;
+otherwise fall back on the adaptive roulette. No R2/R3. They differ from R1 only
+in the choice inside I:
+    best_in_I   : operator with the highest mean gain      (greedy)
+    lower_in_I  : lower median (k=2 -> worst of the two)
+    random_in_I : uniform among the operators of I
+R1 itself (upper median) = ALNS(use_rules=True, rules_variant="R1").
+
+Same conditions as the matched family: ls_prob=0, stagnation_limit=None,
+H=20000, seeds 100, 200, ... Existing baseline/adapted runs are reused.
+Cost: about 10 minutes per run. Start with best_in_I and random_in_I, 10 seeds
+(about 3.5 hours); add lower_in_I only if time allows.
+
+Usage (Colab, with alns_evrp.py and the instance files in /content):
+    !python run_choice_in_I.py
+"""
+import json
+import os
+import random
+
+import numpy as np
+import pandas as pd
+
+from alns_evrp import (ALNS, EVRPSimulator, parse_evrp_instance,
+                       build_instances_dict, verify_solution)
+
+INSTANCE = "E-n101-k8"
+SEEDS = list(range(800, 1100, 100))                    # 10 seeds
+METHODS = ["best_in_I", "random_in_I"]                 # add "lower_in_I" if time
+H = 20000
+OUT_DIR = "results_matched_E101"
+CSV_NEW = os.path.join(OUT_DIR, "runs_choice_in_I.csv")
+CSV_OLD = os.path.join(OUT_DIR, "runs_matched.csv")
+DIAG = os.path.join(OUT_DIR, "diag_choice_in_I.jsonl")
+
+
+class ALNSChoiceInI(ALNS):
+    def __init__(self, *args, choice="best", **kwargs):
+        assert choice in ("best", "lower", "random")
+        kwargs["use_rules"] = True
+        super().__init__(*args, **kwargs)
+        self.choice = choice
+        self.sel_counts = {"in_I": 0, "roulette": 0}
+
+    def _select_destroy_rules(self, destroy_ops):
+        names = list(destroy_ops.keys())
+        avgs = {op: (float(np.mean(self.stats['destroy'][op]['gains']))
+                     if self.stats['destroy'][op]['gains'] else 0.0)
+                for op in names}
+        improving = [op for op in names if avgs[op] > 0]
+        if len(improving) >= 2:
+            self.sel_counts["in_I"] += 1
+            improving.sort(key=lambda op: avgs[op])      # ascending
+            k = len(improving)
+            if self.choice == "best":
+                return improving[-1]
+            if self.choice == "lower":
+                return improving[(k - 1) // 2]
+            return random.choice(improving)
+        self.sel_counts["roulette"] += 1
+        return self._roulette(self._w_d)
+
+
+if __name__ == "__main__":
+    os.makedirs(OUT_DIR, exist_ok=True)
+    raw, bks = build_instances_dict([INSTANCE], "/content/")[INSTANCE]
+    instance = parse_evrp_instance(raw, published_bks=bks, verbose=False)
+    sim = EVRPSimulator(instance)
+    choice_of = {"best_in_I": "best", "lower_in_I": "lower",
+                 "random_in_I": "random"}
+
+    if os.path.exists(CSV_NEW):
+        df = pd.read_csv(CSV_NEW)
+    else:
+        df = pd.DataFrame(columns=["method", "seed", "best_cost", "feasible",
+                                   "time_s"])
+    done = set(zip(df["method"], df["seed"]))
+
+    for seed in SEEDS:
+        for m in METHODS:
+            if (m, seed) in done:
+                continue
+            a = ALNSChoiceInI(instance, sim, max_iterations=H, seed=seed,
+                              verbose=False, ls_prob=0.0, stagnation_limit=None,
+                              choice=choice_of[m])
+            b, h, bt, tt, sol = a.solve()
+            ok = bool(sol) and bool(verify_solution(instance, sim, sol)[0])
+            print(f"seed={seed} {m:12s} best={b:.2f} feasible={ok} "
+                  f"time={tt:.0f}s I-share="
+                  f"{a.sel_counts['in_I'] / max(sum(a.sel_counts.values()), 1):.2f}")
+            df = pd.concat([df, pd.DataFrame([{
+                "method": m, "seed": seed,
+                "best_cost": b if ok else np.nan, "feasible": ok,
+                "time_s": tt}])], ignore_index=True)
+            df.to_csv(CSV_NEW, index=False)
+            with open(DIAG, "a") as f:
+                f.write(json.dumps({"method": m, "seed": seed,
+                                    "sel_counts": a.sel_counts,
+                                    "op_dist": a.get_operator_distribution()})
+                        + "\n")
+
+    # ---- analysis: pre-declared family, two-sided paired Wilcoxon + Holm ----
+    from scipy.stats import wilcoxon
+    from statsmodels.stats.multitest import multipletests
+    old = pd.read_csv(CSV_OLD)
+    old = old[old["method"].isin(["baseline", "adapted"])]
+    allr = pd.concat([old[["method", "seed", "best_cost"]],
+                      df[["method", "seed", "best_cost"]]])
+    allr = allr.drop_duplicates(["method", "seed"], keep="last")
+    wide = allr.pivot(index="seed", columns="method", values="best_cost")
+    wide = wide.loc[[s for s in SEEDS if s in wide.index]]
+    family = [(m, "adapted") for m in METHODS] + [(m, "baseline") for m in METHODS]
+    rows = []
+    for x, y in family:
+        pair = wide[[x, y]].dropna()
+        if len(pair) < 6:
+            continue
+        d = pair[x] - pair[y]
+        rows.append({"comparison": f"{x} vs {y}", "n": len(pair),
+                     "diff_%": 100 * d.mean() / pair[y].mean(),
+                     "wins": f"{int((d < 0).sum())}/{len(d)}",
+                     "p": wilcoxon(pair[x], pair[y]).pvalue})
+    res = pd.DataFrame(rows)
+    if len(res):
+        res["p_holm"] = multipletests(res["p"], method="holm")[1]
+        print(res.round(4).to_string(index=False))
+    print(wide.mean().round(1))
