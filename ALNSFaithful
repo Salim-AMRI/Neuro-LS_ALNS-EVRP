@@ -1,0 +1,120 @@
+# ============================================================
+# CELLULE 1 — Définir ALNSFaithful (version fidèle à Neuro-LS)
+# Évalue TOUS les opérateurs à chaque itération (4× coût/iteration)
+# Local search désactivé (ls_prob=0) pour comparaison équitable
+# ============================================================
+import numpy as np
+import random
+import time
+import math
+from alns_evrp import ALNS, INF
+
+
+class ALNSFaithful(ALNS):
+    """Variante fidèle à Neuro-LS : à chaque itération, évalue TOUS les
+    destroy operators (avec repair greedy), puis applique la règle :
+    - Si au moins 2 candidats améliorent : choisir celui au gain MÉDIAN (R1)
+    - Si aucun n'améliore : choisir celui qui détériore LE PLUS (R2)
+    - Compteur κ (kappa) : force 3 itérations de R1-biaisé après R2
+    """
+
+    def solve_faithful(self):
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        t0 = time.time()
+
+        current = self._initial_solution()
+        if current is None:
+            return INF, [INF], 0.0, time.time() - t0, []
+        current_cost = self.sim.solution_cost(current)
+        if current_cost >= INF:
+            return INF, [INF], 0.0, time.time() - t0, []
+
+        best, best_cost = [list(r) for r in current], current_cost
+        n = len(self.inst.customers)
+
+        if n <= 50:
+            T = 0.05 * current_cost
+        elif n <= 150:
+            T = 0.03 * current_cost
+        else:
+            T = 0.01 * current_cost
+        T_end = self.t_end
+        cooling = (T_end / T) ** (1.0 / max(self.max_iterations, 1))
+
+        # q range
+        if n <= 50:
+            q_min = max(3, int(0.20*n)); q_max = max(q_min+1, int(0.40*n))
+        elif n <= 150:
+            q_min = max(3, int(0.15*n)); q_max = max(q_min+1, int(0.30*n))
+        elif n <= 400:
+            q_min = 2; q_max = max(3, min(int(0.15*n), 30))
+        else:
+            q_min = 2; q_max = max(3, min(int(0.10*n), 40))
+
+        destroy_ops = {
+            'random': self._destroy_random, 'shaw': self._destroy_shaw,
+            'worst': self._destroy_worst, 'route': self._destroy_route,
+        }
+
+        kappa = 0  # no-return counter
+        history = [best_cost]
+
+        for it in range(self.max_iterations):
+            # --- 1. Évaluer TOUS les opérateurs ---
+            candidates = []
+            for name, op in destroy_ops.items():
+                q = random.randint(q_min, q_max)
+                destroyed, removed = op(current, q)
+                cand = self._repair(destroyed, removed, regret=False)
+                if cand is None:
+                    continue
+                c_cost = self.sim.solution_cost(cand)
+                if c_cost >= INF:
+                    continue
+                gain = current_cost - c_cost
+                candidates.append({
+                    'name': name, 'cand': cand, 'cost': c_cost, 'gain': gain,
+                })
+
+            if not candidates:
+                history.append(best_cost)
+                continue
+
+            # --- 2. Appliquer la règle fidèle ---
+            improving = [c for c in candidates if c['gain'] > 0]
+            improving.sort(key=lambda c: c['gain'])
+
+            if kappa > 0:
+                kappa -= 1
+                if improving:
+                    pick = improving[0]
+                else:
+                    pick = min(candidates, key=lambda c: c['gain'])
+            elif len(improving) >= 2:
+                pick = improving[len(improving) // 2]  # R1 médian
+            elif len(improving) == 1:
+                pick = improving[0]
+            else:
+                pick = min(candidates, key=lambda c: c['gain'])  # R2 pire
+                kappa = 3
+
+            # --- 3. Accepter / rejeter ---
+            delta = pick['cost'] - current_cost
+            if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-9)):
+                current, current_cost = pick['cand'], pick['cost']
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best = [list(r) for r in current]
+
+            T *= cooling
+            history.append(best_cost)
+
+            if self.verbose and (it % 100 == 0 or it == self.max_iterations - 1):
+                print(f"    [FAITHFUL] it={it:5d} | best={best_cost:.2f} | κ={kappa}")
+
+        return best_cost, history, 0.0, time.time() - t0, best
+
+
+print("✅ ALNSFaithful défini et prêt")
+print("   Méthode à appeler : alns.solve_faithful()")
