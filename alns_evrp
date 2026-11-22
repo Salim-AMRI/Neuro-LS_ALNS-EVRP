@@ -1,0 +1,817 @@
+%%writefile alns_evrp.py
+# =====================================================================
+# ALNS pour EVRP + Neuro-LS (politique de sélection d'opérateurs)
+# VERSION ABLATION : ajout de rules_variant
+# =====================================================================
+import numpy as np
+import random
+import time
+import re
+import os
+import math
+import pickle
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import Tuple, Dict, Optional
+from collections import deque
+
+INF = float('inf')
+
+
+class TinyMLP:
+    def __init__(self, d_in, hidden=(10, 5)):
+        self.d_in = d_in
+        self.sizes = [d_in] + list(hidden) + [1]
+        self.n_params = sum(self.sizes[i]*self.sizes[i+1] + self.sizes[i+1]
+                            for i in range(len(self.sizes)-1))
+        self.W, self.b = [], []
+
+    def set_theta(self, theta):
+        theta = np.asarray(theta, dtype=float)
+        assert len(theta) == self.n_params
+        idx = 0
+        self.W, self.b = [], []
+        for i in range(len(self.sizes) - 1):
+            n_in, n_out = self.sizes[i], self.sizes[i+1]
+            self.W.append(theta[idx:idx+n_in*n_out].reshape(n_in, n_out))
+            idx += n_in*n_out
+            self.b.append(theta[idx:idx+n_out])
+            idx += n_out
+
+    def forward(self, X):
+        h = np.asarray(X, dtype=float)
+        for i, (W, b) in enumerate(zip(self.W, self.b)):
+            h = h @ W + b
+            if i < len(self.W) - 1:
+                h = np.tanh(h)
+        return h.flatten()
+
+
+@dataclass
+class EVRPInstance:
+    name: str
+    num_vehicles: int
+    capacity: float
+    battery_capacity: float
+    energy_consumption: float
+    depot_coords: Tuple[float, float]
+    customers: Dict[int, Tuple[float, float]]
+    stations: Dict[int, Tuple[float, float]]
+    demands: Dict[int, float]
+    published_bks: Optional[float] = None
+
+
+def parse_evrp_instance(raw_text, published_bks=None, verbose=True):
+    lines = raw_text.strip().split('\n')
+    name, num_vehicles, capacity, battery_capacity = "Unknown", 1, 1000.0, 100.0
+    energy_consumption = 1.0
+    raw_coords, station_ids, depot_ids, demands = {}, [], [], {}
+    section = ""
+
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        if line == "EOF": break
+        upper = line.upper()
+
+        if "NODE_COORD_SECTION" in upper: section = "coords"; continue
+        elif "STATION" in upper and "COORD" in upper: section = "stations"; continue
+        elif "DEPOT_SECTION" in upper: section = "depot"; continue
+        elif "DEMAND_SECTION" in upper: section = "demand"; continue
+
+        if section == "":
+            nums = re.findall(r'\d+\.\d+|\d+', line)
+            if upper.startswith("NAME"):
+                name = line.split(":")[-1].strip()
+            elif "VEHICLES" in upper and nums:
+                num_vehicles = int(nums[0])
+            elif "ENERGY_CAPACITY" in upper and nums:
+                battery_capacity = float(nums[0])
+            elif "ENERGY_CONSUMPTION" in upper and nums:
+                energy_consumption = float(nums[0])
+            elif "CAPACITY" in upper and nums:
+                capacity = float(nums[0])
+            continue
+
+        p = line.split()
+        if section == "coords" and len(p) >= 3:
+            raw_coords[int(p[0])] = (float(p[1]), float(p[2]))
+        elif section == "stations" and p:
+            try: station_ids.append(int(p[0]))
+            except ValueError: pass
+        elif section == "depot" and p:
+            try:
+                v = int(p[0])
+                if v != -1: depot_ids.append(v)
+            except ValueError: pass
+        elif section == "demand" and len(p) == 2:
+            demands[int(p[0])] = float(p[1])
+
+    depot_id = depot_ids[0] if depot_ids else 1
+    depot_coords = raw_coords.get(depot_id, (0.0, 0.0))
+    customers, stations = {}, {}
+    for nid, coord in raw_coords.items():
+        if nid == depot_id: continue
+        if nid in station_ids: stations[nid] = coord
+        else: customers[nid] = coord
+    for c in customers:
+        demands.setdefault(c, 0.0)
+
+    if verbose:
+        print(f"  📍 {len(customers)} clients, {len(stations)} stations, "
+              f"{num_vehicles} véh., batterie={battery_capacity:.1f}")
+
+    return EVRPInstance(name, num_vehicles, capacity, battery_capacity,
+                        energy_consumption, depot_coords, customers, stations,
+                        demands, published_bks)
+
+
+class EVRPSimulator:
+    def __init__(self, instance):
+        self.instance = instance
+        self.node_coords = {0: instance.depot_coords}
+        self.node_coords.update(instance.customers)
+        self.node_coords.update(instance.stations)
+        ids = list(self.node_coords.keys())
+        self.idx = {n: i for i, n in enumerate(ids)}
+        pts = np.array([self.node_coords[n] for n in ids], dtype=float)
+        diff = pts[:, None, :] - pts[None, :, :]
+        self.D = np.sqrt((diff ** 2).sum(-1)).tolist()
+        self.range_km = instance.battery_capacity / max(instance.energy_consumption, 1e-9)
+        self.stations = list(instance.stations.keys())
+        refuel = [0] + self.stations
+        self.refuel_dist = {
+            n: min(self.D[self.idx[n]][self.idx[s]] for s in refuel) for n in ids
+        }
+        self._cache = {}
+
+    def _dist(self, a, b): return self.D[self.idx[a]][self.idx[b]]
+
+    def route_eval(self, route):
+        key = tuple(route)
+        r = self._cache.get(key)
+        if r is None:
+            r = self._route_eval(route)
+            if len(self._cache) > 400000: self._cache.clear()
+            self._cache[key] = r
+        return r
+
+    def route_cost(self, route): return self.route_eval(route)[0]
+
+    def _route_eval(self, route):
+        if not route: return (0.0, 0, (0, 0))
+        inst = self.instance
+        if sum(inst.demands[c] for c in route) > inst.capacity + 1e-9:
+            return (INF, 0, ())
+        R, eps = self.range_km, 1e-9
+        D, idx = self.D, self.idx
+        cur, rem, dist, nst = 0, R, 0.0, 0
+        path = [0]
+        for nxt in list(route) + [0]:
+            d = D[idx[cur]][idx[nxt]]
+            tail = self.refuel_dist[nxt] if nxt != 0 else 0.0
+            if d + tail <= rem + eps:
+                rem -= d; dist += d
+            else:
+                best = None
+                for s in self.stations:
+                    a = D[idx[cur]][idx[s]]
+                    if a > rem + eps: continue
+                    b = D[idx[s]][idx[nxt]]
+                    if b + tail > R + eps: continue
+                    if best is None or a + b < best[0]:
+                        best = (a + b, s, b)
+                if best is None: return (INF, 0, ())
+                dist += best[0]; rem = R - best[2]; nst += 1
+                path.append(best[1])
+            path.append(nxt); cur = nxt
+        return (dist, nst, tuple(path))
+
+    def solution_cost(self, solution):
+        inst = self.instance
+        if len(solution) > inst.num_vehicles: return INF
+        flat = [c for r in solution for c in r]
+        if len(flat) != len(inst.customers) or set(flat) != set(inst.customers):
+            return INF
+        total = 0.0
+        for r in solution:
+            c = self.route_cost(r)
+            if c == INF: return INF
+            total += c
+        return total
+
+
+def verify_solution(instance, sim, sol):
+    flat = [c for r in sol for c in r]
+    ok = sorted(flat) == sorted(instance.customers.keys())
+    ok &= len(sol) <= instance.num_vehicles
+    total, n_st = 0.0, 0
+    for r in sol:
+        d, ns, path = sim.route_eval(r)
+        if d == INF: return False, INF, 0
+        if sum(instance.demands[c] for c in r) > instance.capacity + 1e-9:
+            ok = False
+        rem = sim.range_km
+        for a, b in zip(path, path[1:]):
+            rem -= sim._dist(a, b)
+            if rem < -1e-6: ok = False
+            if b == 0 or b in instance.stations: rem = sim.range_km
+        total += d; n_st += ns
+    return ok, total, n_st
+
+
+def first_fit_decreasing(instance, max_vehicles=None):
+    if max_vehicles is None: max_vehicles = instance.num_vehicles
+    clients = sorted(instance.customers.keys(),
+                     key=lambda c: instance.demands[c], reverse=True)
+    routes, loads = [], []
+    for c in clients:
+        d = instance.demands[c]; placed = False
+        for i in range(len(routes)):
+            if loads[i] + d <= instance.capacity + 1e-9:
+                routes[i].append(c); loads[i] += d; placed = True; break
+        if not placed:
+            if len(routes) < max_vehicles:
+                routes.append([c]); loads.append(d)
+            else:
+                routes[-1].append(c); loads[-1] += d
+    return routes
+
+
+def best_insertion_initial(instance, simulator):
+    routes = []
+    clients = list(instance.customers.keys())
+    random.shuffle(clients)
+    first = clients.pop(0)
+    routes.append([first])
+    for c in clients:
+        best_delta = INF; best_route = None; best_pos = None
+        for ri, r in enumerate(routes):
+            current_load = sum(instance.demands[x] for x in r)
+            if current_load + instance.demands[c] > instance.capacity + 1e-9: continue
+            base_cost = simulator.route_cost(r)
+            for pos in range(len(r) + 1):
+                trial = r[:pos] + [c] + r[pos:]
+                cost = simulator.route_cost(trial)
+                if cost < INF:
+                    delta = cost - base_cost
+                    if delta < best_delta:
+                        best_delta = delta; best_route = ri; best_pos = pos
+        if best_route is None:
+            if len(routes) < instance.num_vehicles: routes.append([c])
+            else:
+                least_loaded = min(range(len(routes)),
+                                   key=lambda i: sum(instance.demands[x] for x in routes[i]))
+                routes[least_loaded].append(c)
+        else:
+            routes[best_route].insert(best_pos, c)
+    return routes
+
+
+def diagnostic_instance(instance, sim):
+    print(f"\n{'='*65}\nDIAGNOSTIC {instance.name}\n{'='*65}")
+    total_demand = sum(instance.demands.values())
+    fleet_capacity = instance.num_vehicles * instance.capacity
+    ratio = total_demand / fleet_capacity if fleet_capacity > 0 else 0
+    print(f"Somme demandes : {total_demand:.0f} | Capacité : {fleet_capacity:.0f} "
+          f"| Ratio : {ratio:.3f} {'⚠️' if ratio > 0.9 else '✅'}")
+    n = len(instance.customers)
+    print(f"Clients : {n} | Véhicules : {instance.num_vehicles} | "
+          f"Clients/route : {n / instance.num_vehicles:.1f}")
+
+
+class ALNS:
+    DESTROY_NAMES = ['random', 'shaw', 'worst', 'route']
+    REPAIR_NAMES  = ['greedy', 'regret2']
+    D_DESTROY     = 9
+    D_REPAIR      = 8
+
+    VALID_VARIANTS = ["R1", "R2", "R3", "R1R2", "R1R3", "R2R3", "R1R2R3"]
+
+    def __init__(self, instance, simulator, max_iterations=None, seed=42,
+                 verbose=True, t_end=0.01, segment=100, reaction=0.1,
+                 sigmas=(33, 9, 3), ls_prob=0.2, stagnation_limit=None,
+                 use_rules=False, rules_variant="R1R2R3"):
+        self.inst = instance
+        self.sim = simulator
+        self.seed = seed
+        self.verbose = verbose
+        self.t_end = t_end
+        self.segment = segment
+        self.reaction = reaction
+        self.sigmas = sigmas
+        self.ls_prob = ls_prob
+        self.stagnation_limit = stagnation_limit
+
+        # ✅ ABLATION : quel sous-ensemble de règles activer
+        self.use_rules = use_rules
+        self.rules_variant = rules_variant
+        assert rules_variant in self.VALID_VARIANTS, \
+            f"rules_variant doit être dans {self.VALID_VARIANTS}"
+
+        self.use_policy      = False
+        self.policy_destroy  = None
+        self.policy_repair   = None
+        self.operator_counts = {op: 0 for op in self.DESTROY_NAMES}
+
+        self.WIN = 30
+        self.stats = {
+            'destroy': {op: {'gains': deque(maxlen=self.WIN),
+                             'fail' : deque(maxlen=self.WIN),
+                             'last' : -1} for op in self.DESTROY_NAMES},
+            'repair' : {op: {'gains': deque(maxlen=self.WIN),
+                             'fail' : deque(maxlen=self.WIN),
+                             'last' : -1} for op in self.REPAIR_NAMES},
+        }
+
+        self._best_seen    = float('inf')
+        self._T_now        = 1.0
+        self._w_d          = None
+        self._w_r          = None
+        self._no_improve   = 0
+        self._post_jump    = 0
+        self._stagn_thresh = 200
+
+        n = len(instance.customers)
+        if max_iterations is None:
+            if n <= 100:   self.max_iterations = 2000
+            elif n <= 200: self.max_iterations = 3000
+            elif n <= 400: self.max_iterations = 5000
+            else:          self.max_iterations = 8000
+        else:
+            self.max_iterations = max_iterations
+
+    def set_policy(self, theta_destroy, theta_repair):
+        self.policy_destroy = TinyMLP(self.D_DESTROY)
+        self.policy_destroy.set_theta(theta_destroy)
+        self.policy_repair = TinyMLP(self.D_REPAIR)
+        self.policy_repair.set_theta(theta_repair)
+        self.use_policy = True
+
+    def _features(self, kind, current, it, current_cost):
+        H = max(self.max_iterations, 1)
+        best = self._best_seen if np.isfinite(self._best_seen) else current_cost
+        gap = (current_cost - best) / max(abs(best), 1e-9)
+        temp = math.log(max(self._T_now, 1e-9))
+        n_routes = max(len(current), 1)
+        avg_load = (np.mean([sum(self.inst.demands[c] for c in r)
+                             for r in current]) / max(self.inst.capacity, 1e-9)
+                    if current else 0.0)
+        n_routes_norm = n_routes / max(self.inst.num_vehicles, 1)
+        ops = list(self.stats[kind].keys())
+        avg_gains = [float(np.mean(self.stats[kind][op]['gains']))
+                     if self.stats[kind][op]['gains'] else 0.0
+                     for op in ops]
+        rows = []
+        for op in ops:
+            s = self.stats[kind][op]
+            gains = list(s['gains']); fails = list(s['fail'])
+            succ  = 1.0 - (sum(fails)/len(fails) if fails else 0.5)
+            avg_g = float(np.mean(gains)) if gains else 0.0
+            std_g = float(np.std(gains))  if len(gains) > 1 else 1.0
+            z     = float(np.clip((gains[-1]-avg_g)/max(std_g, 1e-9), -3, 3)) if gains else 0.0
+            rank  = (sum(1 for g in avg_gains if g < avg_g) / max(len(ops)-1, 1))
+            since = (it - s['last']) / H if s['last'] >= 0 else 1.0
+            if kind == 'destroy':
+                rows.append([succ, rank, z, since, avg_load, n_routes_norm, it/H, gap, temp])
+            else:
+                rows.append([succ, rank, z, since, avg_load, it/H, gap, temp])
+        return np.array(rows, dtype=float)
+
+    def _select_destroy(self, current, it, destroy_ops, current_cost):
+        if self.use_policy and self.policy_destroy is not None:
+            feats  = self._features('destroy', current, it, current_cost)
+            scores = self.policy_destroy.forward(feats)
+            names  = list(destroy_ops.keys())
+            return names[int(np.argmax(scores))]
+        if self.use_rules:
+            return self._select_destroy_rules(destroy_ops)
+        return self._roulette(self._w_d)
+
+    def _select_repair(self, current, it, repair_ops, current_cost):
+        if self.use_policy and self.policy_repair is not None:
+            feats  = self._features('repair', current, it, current_cost)
+            scores = self.policy_repair.forward(feats)
+            return repair_ops[int(np.argmax(scores))]
+        return self._roulette(self._w_r)
+
+    def _select_destroy_rules(self, destroy_ops):
+        """Ablation : active seulement les règles du sous-ensemble rules_variant."""
+        names = list(destroy_ops.keys())
+        avgs = {op: (float(np.mean(self.stats['destroy'][op]['gains']))
+                     if self.stats['destroy'][op]['gains'] else 0.0)
+                for op in names}
+        improving = [op for op in names if avgs[op] > 0]
+
+        v = self.rules_variant
+        use_r1 = "R1" in v
+        use_r2 = "R2" in v
+        use_r3 = "R3" in v
+
+        # R3 : no-return guard (déclenché par R2, donc utile uniquement si R2 actif)
+        if use_r3 and self._post_jump > 0:
+            self._post_jump -= 1
+            if improving:
+                improving.sort(key=lambda op: avgs[op])
+                return improving[0]
+            return random.choice(names)
+
+        # R2 : worst-jump on stagnation
+        if use_r2 and self._no_improve >= self._stagn_thresh:
+            worst = min(names, key=lambda op: avgs[op])
+            if use_r3:
+                self._post_jump = 3
+            return worst
+
+        # R1 : small-step (median-gain)
+        if use_r1 and len(improving) >= 2:
+            improving.sort(key=lambda op: avgs[op])
+            return improving[len(improving)//2]
+
+        return self._roulette(self._w_d)
+
+    @staticmethod
+    def _remove(sol, to_remove):
+        s = set(to_remove)
+        new = [[c for c in r if c not in s] for r in sol]
+        return [r for r in new if r]
+
+    def _destroy_random(self, sol, q):
+        clients = [c for r in sol for c in r]
+        removed = random.sample(clients, min(q, len(clients)))
+        return self._remove(sol, removed), removed
+
+    def _destroy_shaw(self, sol, q, p=6):
+        clients = [c for r in sol for c in r]
+        first = random.choice(clients)
+        removed = [first]
+        remaining = [c for c in clients if c != first]
+        while len(removed) < q and remaining:
+            ref = random.choice(removed)
+            remaining.sort(key=lambda c: self.sim._dist(ref, c))
+            pick = remaining.pop(int(len(remaining) * random.random() ** p))
+            removed.append(pick)
+        return self._remove(sol, removed), removed
+
+    def _destroy_worst(self, sol, q, p=3):
+        cur = [list(r) for r in sol]; removed = []
+        for _ in range(q):
+            gains = []
+            for ri, r in enumerate(cur):
+                base = self.sim.route_cost(r)
+                for ci, c in enumerate(r):
+                    new_r = r[:ci] + r[ci + 1:]
+                    gains.append((base - self.sim.route_cost(new_r), ri, c))
+            if not gains: break
+            gains.sort(reverse=True)
+            _, ri, c = gains[int(len(gains) * random.random() ** p)]
+            cur[ri].remove(c); removed.append(c)
+            cur = [r for r in cur if r]
+        return cur, removed
+
+    def _destroy_route(self, sol, q):
+        if len(sol) <= 1: return self._destroy_random(sol, q)
+        order = sorted(range(len(sol)), key=lambda i: len(sol[i]))
+        ri = random.choice(order[:2])
+        removed = list(sol[ri])
+        return [list(r) for i, r in enumerate(sol) if i != ri], removed
+
+    def _options(self, sol, costs, loads, client, top_k=15):
+        dem = self.inst.demands[client]; cap = self.inst.capacity
+        feasible = [ri for ri, r in enumerate(sol) if loads[ri] + dem <= cap + 1e-9]
+        if not feasible:
+            if len(sol) < self.inst.num_vehicles:
+                c = self.sim.route_cost([client])
+                if c < INF: return [(c, len(sol), 0)]
+            return []
+        feasible.sort(key=lambda ri: min(self.sim._dist(client, c2) for c2 in sol[ri]))
+        opts = []
+        for ri in feasible[:top_k]:
+            r = sol[ri]; best = None
+            for pos in range(len(r) + 1):
+                c = self.sim.route_cost(r[:pos] + [client] + r[pos:])
+                if c < INF:
+                    d = c - costs[ri]
+                    if best is None or d < best[0]: best = (d, ri, pos)
+            if best: opts.append(best)
+        if len(sol) < self.inst.num_vehicles:
+            c = self.sim.route_cost([client])
+            if c < INF: opts.append((c, len(sol), 0))
+        return opts
+
+    def _apply(self, sol, costs, loads, client, opt):
+        _, ri, pos = opt
+        if ri == len(sol):
+            sol.append([client]); costs.append(0.0); loads.append(0.0)
+        else:
+            sol[ri].insert(pos, client)
+        costs[ri] = self.sim.route_cost(sol[ri])
+        loads[ri] += self.inst.demands[client]
+
+    def _repair(self, sol, removed, regret, counters=None):
+        sol = [list(r) for r in sol]; removed = list(removed)
+        costs = [self.sim.route_cost(r) for r in sol]
+        loads = [sum(self.inst.demands[c] for c in r) for r in sol]
+        if not regret: random.shuffle(removed)
+        while removed:
+            if regret:
+                pick = None
+                for c in removed:
+                    opts = self._options(sol, costs, loads, c)
+                    if not opts:
+                        if counters is not None: counters["fail_no_capacity"] += 1
+                        return None
+                    opts.sort()
+                    rv = (opts[1][0] - opts[0][0]) if len(opts) > 1 else 1e9
+                    key = (rv, -opts[0][0])
+                    if pick is None or key > pick[0]: pick = (key, c, opts[0])
+                _, client, opt = pick
+            else:
+                client = removed[0]
+                opts = self._options(sol, costs, loads, client)
+                if not opts:
+                    if counters is not None: counters["fail_no_capacity"] += 1
+                    return None
+                opt = min(opts)
+            self._apply(sol, costs, loads, client, opt)
+            removed.remove(client)
+        return sol
+
+    def _local_search(self, sol):
+        sol = [list(r) for r in sol]
+        for ri in range(len(sol)):
+            r = sol[ri]; best = self.sim.route_cost(r); improved = True
+            while improved:
+                improved = False
+                for i in range(len(r) - 1):
+                    for j in range(i + 1, len(r)):
+                        new = r[:i] + r[i:j + 1][::-1] + r[j + 1:]
+                        c = self.sim.route_cost(new)
+                        if c < best - 1e-9:
+                            r, best, improved = new, c, True; break
+                    if improved: break
+            sol[ri] = r
+        return sol
+
+    def _local_search_inter(self, sol, max_passes=2):
+        sol = [list(r) for r in sol]
+        for _ in range(max_passes):
+            improved = False
+            for r1 in range(len(sol)):
+                if len(sol[r1]) <= 1: continue
+                for c in list(sol[r1]):
+                    old_r1 = self.sim.route_cost(sol[r1])
+                    new_r1 = [x for x in sol[r1] if x != c]
+                    new_r1_cost = self.sim.route_cost(new_r1)
+                    best_imp = 0; best_move = None
+                    for r2 in range(len(sol)):
+                        if r1 == r2: continue
+                        if (sum(self.inst.demands[x] for x in sol[r2])
+                                + self.inst.demands[c] > self.inst.capacity + 1e-9):
+                            continue
+                        old_r2 = self.sim.route_cost(sol[r2])
+                        best_pos, best_r2_cost = None, INF
+                        for pos in range(len(sol[r2]) + 1):
+                            trial = sol[r2][:pos] + [c] + sol[r2][pos:]
+                            cost = self.sim.route_cost(trial)
+                            if cost < best_r2_cost:
+                                best_r2_cost = cost; best_pos = pos
+                        if best_pos is None: continue
+                        delta = (new_r1_cost + best_r2_cost) - (old_r1 + old_r2)
+                        if delta < best_imp - 1e-9:
+                            best_imp = delta; best_move = (c, r1, r2, best_pos, new_r1)
+                    if best_move is not None:
+                        c_, r1_, r2_, pos_, new_r1_ = best_move
+                        sol[r1_] = new_r1_; sol[r2_].insert(pos_, c_)
+                        improved = True; break
+                if improved: break
+            if not improved: break
+        return sol
+
+    def _initial_solution(self, tries=300):
+        sol = first_fit_decreasing(self.inst)
+        if sol is not None and len(sol) <= self.inst.num_vehicles:
+            if self.sim.solution_cost(sol) < INF:
+                if self.verbose: print(f"    [ALNS] Init FFD ({len(sol)} routes)")
+                return sol
+        sol = best_insertion_initial(self.inst, self.sim)
+        if sol is not None and len(sol) <= self.inst.num_vehicles:
+            if self.sim.solution_cost(sol) < INF:
+                if self.verbose: print(f"    [ALNS] Init Best Insertion ({len(sol)} routes)")
+                return sol
+        clients = list(self.inst.customers.keys())
+        for _ in range(tries):
+            random.shuffle(clients)
+            sol = self._repair([], clients, regret=False)
+            if sol is not None:
+                if self.verbose: print(f"    [ALNS] Init Repair ({len(sol)} routes)")
+                return sol
+        return None
+
+    @staticmethod
+    def _roulette(weights):
+        names = list(weights.keys()); tot = sum(weights.values())
+        r = random.random() * tot; cum = 0.0
+        for n in names:
+            cum += weights[n]
+            if r <= cum: return n
+        return names[-1]
+
+    def solve(self):
+        random.seed(self.seed); np.random.seed(self.seed)
+        t0 = time.time()
+
+        current = self._initial_solution()
+        if current is None:
+            if self.verbose: print("    [ALNS] Aucune solution initiale faisable")
+            return INF, [INF], 0.0, time.time() - t0, []
+        current_cost = self.sim.solution_cost(current)
+        if current_cost >= INF:
+            return INF, [INF], 0.0, time.time() - t0, []
+
+        best, best_cost, best_time = [list(r) for r in current], current_cost, 0.0
+        self._best_seen = current_cost
+        n = len(self.inst.customers)
+
+        if n <= 50:    T = 0.05 * current_cost
+        elif n <= 150: T = 0.03 * current_cost
+        else:          T = 0.01 * current_cost
+        T_end = self.t_end
+        cooling = (T_end / T) ** (1.0 / max(self.max_iterations, 1))
+        self._T_now = T
+
+        if n <= 50:
+            q_min = max(3, int(0.20*n)); q_max = max(q_min+1, int(0.40*n))
+        elif n <= 150:
+            q_min = max(3, int(0.15*n)); q_max = max(q_min+1, int(0.30*n))
+        elif n <= 400:
+            q_min = 2; q_max = max(3, min(int(0.15*n), 30))
+        else:
+            q_min = 2; q_max = max(3, min(int(0.10*n), 40))
+
+        if self.verbose:
+            mode = "POLICY" if self.use_policy else (f"RULES[{self.rules_variant}]" if self.use_rules else "ROULETTE")
+            print(f"    [ALNS] n={n} | max_it={self.max_iterations} | mode={mode} | "
+                  f"q∈[{q_min},{q_max}] | T0={T:.1f} | T_end={T_end}"
+                  + (f" | stag={self.stagnation_limit}" if self.stagnation_limit else ""))
+
+        destroy_ops = {'random': self._destroy_random, 'shaw': self._destroy_shaw,
+                       'worst': self._destroy_worst, 'route': self._destroy_route}
+        repair_ops = ['greedy', 'regret2']
+        w_d = {k: 1.0 for k in destroy_ops}; w_r = {k: 1.0 for k in repair_ops}
+        sc_d = {k: 0.0 for k in w_d}; us_d = {k: 0 for k in w_d}
+        sc_r = {k: 0.0 for k in w_r}; us_r = {k: 0 for k in w_r}
+        self._w_d, self._w_r = w_d, w_r
+        self._stagn_thresh = max(200, self.max_iterations // 20)
+
+        counters = {
+            "destroy_used": {k: 0 for k in destroy_ops},
+            "repair_failed": 0, "repair_success": 0,
+            "accepted": 0, "improved_best": 0,
+            "fail_no_capacity": 0, "fail_other": 0,
+        }
+
+        history = [best_cost]
+        no_improve_count = 0
+
+        for it in range(self.max_iterations):
+            dop = self._select_destroy(current, it, destroy_ops, current_cost)
+            rop = self._select_repair(current, it, repair_ops, current_cost)
+            us_d[dop] += 1; us_r[rop] += 1
+            counters["destroy_used"][dop] += 1
+            self.operator_counts[dop] += 1
+
+            q = random.randint(q_min, q_max)
+            destroyed, removed = destroy_ops[dop](current, q)
+
+            prev_fail = counters["fail_no_capacity"]
+            cand = self._repair(destroyed, removed, regret=(rop == 'regret2'),
+                                counters=counters)
+
+            if cand is None:
+                counters["repair_failed"] += 1
+                if counters["fail_no_capacity"] == prev_fail:
+                    counters["fail_other"] += 1
+                self.stats['destroy'][dop]['fail'].append(1)
+                self.stats['repair'][rop]['fail'].append(1)
+                no_improve_count += 1
+                self._no_improve += 1
+            else:
+                counters["repair_success"] += 1
+                self.stats['destroy'][dop]['fail'].append(0)
+                self.stats['repair'][rop]['fail'].append(0)
+                if random.random() < self.ls_prob:
+                    cand = self._local_search(cand)
+                    cand = self._local_search_inter(cand)
+                c_cost = self.sim.solution_cost(cand)
+                if c_cost < INF:
+                    delta = c_cost - current_cost
+                    gain  = -delta
+                    self.stats['destroy'][dop]['gains'].append(gain)
+                    self.stats['repair'][rop]['gains'].append(gain)
+                    score = 0
+                    if c_cost < best_cost - 1e-9:
+                        best_cost, best = c_cost, [list(r) for r in cand]
+                        best_time = time.time() - t0
+                        score = self.sigmas[0]
+                        counters["improved_best"] += 1
+                        no_improve_count = 0
+                        self._no_improve = 0
+                        self._best_seen = c_cost
+                    else:
+                        no_improve_count += 1
+                        self._no_improve += 1
+                    if delta < 0 or random.random() < math.exp(-delta / max(T, 1e-9)):
+                        if score == 0:
+                            score = self.sigmas[1] if delta < -1e-9 else self.sigmas[2]
+                        current, current_cost = cand, c_cost
+                        counters["accepted"] += 1
+                    sc_d[dop] += score; sc_r[rop] += score
+                else:
+                    no_improve_count += 1
+                    self._no_improve += 1
+
+            self.stats['destroy'][dop]['last'] = it
+            self.stats['repair'][rop]['last']  = it
+
+            T *= cooling
+            self._T_now = T
+            history.append(best_cost)
+
+            if (it + 1) % self.segment == 0:
+                for w, sc, us in ((w_d, sc_d, us_d), (w_r, sc_r, us_r)):
+                    for k in w:
+                        if us[k] > 0:
+                            w[k] = ((1 - self.reaction) * w[k]
+                                    + self.reaction * sc[k] / us[k])
+                        w[k] = max(w[k], 0.05)
+                        sc[k] = 0.0; us[k] = 0
+
+            if self.verbose and (it % 500 == 0 or it == self.max_iterations - 1):
+                print(f"    [ALNS] it={it:5d} | best={best_cost:.2f} | T={T:.3f} "
+                      f"| no_improve={no_improve_count}")
+
+            if (self.stagnation_limit is not None
+                    and no_improve_count >= self.stagnation_limit):
+                if self.verbose:
+                    print(f"    [ALNS] ⏹ Stagnation à it={it}")
+                break
+
+        return best_cost, history, best_time, time.time() - t0, best
+
+    def get_operator_distribution(self):
+        total = sum(self.operator_counts.values())
+        if total == 0:
+            return {k: 0.0 for k in self.operator_counts}
+        return {k: 100.0 * v / total for k, v in self.operator_counts.items()}
+
+
+INSTANCES_DIR = "/content/"
+
+PUBLISHED_BKS = {
+    "E-n22-k4":   384.67,
+    "E-n23-k3":   569.09,
+    "E-n30-k3":   511.05,
+    "E-n33-k4":   835.50,
+    "E-n51-k5":   521.00,
+    "E-n76-k7":   682.00,
+    "E-n101-k8":  815.0,
+    "X-n143-k7":  15700.0,
+    "X-n214-k11": 10856.0,
+    "X-n351-k40": 25896.0,
+    "X-n459-k26": 25929.20,
+}
+
+MAX_ITERATIONS_OVERRIDE = {
+    "E-n22-k4": 5000, "E-n23-k3": 5000, "E-n30-k3": 5000,
+    "E-n33-k4": 5000, "E-n51-k5": 5000, "E-n76-k7": 5000,
+    "E-n101-k8": 5000, "X-n143-k7": 20000, "X-n214-k11": 20000,
+    "X-n351-k40": 20000, "X-n459-k26": 20000,
+}
+
+STAGNATION_LIMIT = {
+    "E-n22-k4": None, "E-n23-k3": None, "E-n30-k3": None, "E-n33-k4": None,
+    "E-n51-k5": 3000, "E-n76-k7": 4000, "E-n101-k8": 5000,
+    "X-n143-k7": 5000, "X-n214-k11": 5000, "X-n351-k40": 6000,
+    "X-n459-k26": 6000,
+}
+
+
+def build_instances_dict(instance_names, instances_dir):
+    instances = {}
+    for name in instance_names:
+        filepath = None
+        for ext in ['.evrp', '.txt', '.vrp', '']:
+            cand = os.path.join(instances_dir, f"{name}{ext}")
+            if os.path.exists(cand):
+                filepath = cand; break
+        if filepath is None:
+            print(f"⚠️ Fichier introuvable : {name}")
+            continue
+        with open(filepath, 'r', encoding='utf-8') as f:
+            instances[name] = (f.read(), PUBLISHED_BKS.get(name))
+        print(f"✅ Chargée : {name} (BKS = {PUBLISHED_BKS.get(name)})")
+    return instances
