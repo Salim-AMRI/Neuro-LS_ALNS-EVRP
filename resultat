@@ -1,0 +1,99 @@
+# ============================================================
+# ANALYSE — adapted vs les 4 contrôles (Wilcoxon apparié + Holm)
+# ============================================================
+import numpy as np
+import pandas as pd
+from scipy.stats import wilcoxon, binomtest
+from statsmodels.stats.multitest import multipletests
+
+CSV_PATH = "results_matched_X214/runs_matched.csv"
+df = pd.read_csv(CSV_PATH)
+
+# --- Tableau large : seed × method ---
+wide = df.pivot(index="seed", columns="method", values="best_cost")
+print("=" * 80)
+print("RÉSULTATS BRUTS (best_cost par seed × méthode)")
+print("=" * 80)
+print(wide.round(2).to_string())
+
+# --- Résumé par méthode ---
+print("\n" + "=" * 80)
+print("RÉSUMÉ PAR MÉTHODE")
+print("=" * 80)
+summary = df.groupby("method")["best_cost"].agg(
+    ["count", "mean", "std", "min", "median"]).round(2)
+# Ajouter Δ vs baseline
+baseline_mean = summary.loc["baseline", "mean"]
+summary["Δ vs baseline %"] = (
+    100 * (summary["mean"] - baseline_mean) / baseline_mean
+).round(2)
+print(summary.to_string())
+
+# --- Tests appariés : adapted vs chacun ---
+print("\n" + "=" * 80)
+print("TESTS WILCOXON APPARIÉS (adapted vs chaque contrôle)")
+print("=" * 80)
+
+tests = []
+for control in ["baseline", "uniform", "2nd_best", "epsilon_greedy"]:
+    pair = wide[["adapted", control]].dropna()
+    if len(pair) < 4:
+        print(f"  ⚠️ {control}: trop peu de seeds communs")
+        continue
+    diff = pair["adapted"] - pair[control]
+    delta_pct = 100 * diff.mean() / pair[control].mean()
+    wins = int((diff < 0).sum())
+    n = len(pair)
+    try:
+        p = wilcoxon(pair["adapted"], pair[control],
+                     alternative="less").pvalue
+    except Exception:
+        p = 1.0
+    tests.append({
+        "comparison": f"adapted vs {control}",
+        "n": n,
+        "mean_adapted": pair["adapted"].mean(),
+        "mean_control": pair[control].mean(),
+        "delta_%": delta_pct,
+        "wins_adapted": f"{wins}/{n}",
+        "p_raw": p,
+    })
+
+res = pd.DataFrame(tests)
+if len(res):
+    res["p_holm"] = multipletests(res["p_raw"], method="holm")[1]
+    print(res.round(4).to_string(index=False))
+else:
+    print("  Aucune comparaison valide")
+
+# --- Synthèse ---
+print("\n" + "=" * 80)
+print("INTERPRÉTATION")
+print("=" * 80)
+if len(res):
+    n_sig_vs_uniform = int((res.loc[res.comparison == "adapted vs uniform",
+                                     "p_holm"] < 0.05).sum())
+    n_sig_vs_2ndbest = int((res.loc[res.comparison == "adapted vs 2nd_best",
+                                     "p_holm"] < 0.05).sum())
+    n_sig_vs_eps = int((res.loc[res.comparison == "adapted vs epsilon_greedy",
+                                 "p_holm"] < 0.05).sum())
+
+    print(f"  adapted bat uniform (p_holm<0.05)         : "
+          f"{'✅ OUI' if n_sig_vs_uniform else '❌ NON'}")
+    print(f"  adapted bat 2nd_best (p_holm<0.05)        : "
+          f"{'✅ OUI' if n_sig_vs_2ndbest else '❌ NON'}")
+    print(f"  adapted bat ε-greedy (p_holm<0.05)        : "
+          f"{'✅ OUI' if n_sig_vs_eps else '❌ NON'}")
+
+    print("\n  → Message pour l'article :")
+    if n_sig_vs_uniform and n_sig_vs_2ndbest and n_sig_vs_eps:
+        print("     ✅ La règle médian apporte un gain spécifique")
+        print("     vs toutes les stratégies de diversification testées.")
+    elif n_sig_vs_uniform and not n_sig_vs_2ndbest:
+        print("     ⚠️ C'est 'éviter le meilleur' qui compte,")
+        print("     pas 'médian' spécifiquement.")
+    elif not n_sig_vs_uniform:
+        print("     ❌ Le gain vient d'ailleurs (pas de la sélection).")
+        print("     Revoir la narrative du papier.")
+    else:
+        print("     🟡 Résultat mixte — analyser au cas par cas.")
