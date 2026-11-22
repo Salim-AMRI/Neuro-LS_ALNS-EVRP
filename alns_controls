@@ -1,0 +1,73 @@
+%%writefile alns_controls.py
+# ============================================================
+# alns_controls.py — Variantes de sélection pour contrôles
+# Hérite de ALNS, override _select_destroy selon la variante
+# ============================================================
+import random
+import numpy as np
+from alns_evrp import ALNS
+
+
+class ALNSControlled(ALNS):
+    """
+    Variantes de sélection pour contrôles cheap :
+
+    - selection="uniform"        : random.choice parmi les 4 opérateurs
+    - selection="2nd_best"       : 2e opérateur au gain moyen le plus élevé
+    - selection="epsilon_greedy" : ε% random, sinon meilleur gain
+    - selection="median"         : médian (équivalent adapted, pour référence)
+    """
+
+    def __init__(self, *args, selection="uniform", epsilon=0.1, **kwargs):
+        super().__init__(*args, **kwargs)
+        if selection not in ("uniform", "2nd_best", "epsilon_greedy", "median"):
+            raise ValueError(f"Unknown selection: {selection}")
+        self.selection = selection
+        self.epsilon = epsilon
+
+    def _select_destroy(self, current, it, destroy_ops, current_cost):
+        names = list(destroy_ops.keys())
+
+        # --- Uniform : aléatoire pur ---
+        if self.selection == "uniform":
+            return random.choice(names)
+
+        # --- Calcul des gains moyens récents ---
+        avgs = {}
+        for op in names:
+            gains = self.stats['destroy'][op]['gains']
+            avgs[op] = float(np.mean(gains)) if gains else 0.0
+
+        # --- 2nd best : 2e gain le plus élevé (pas médian) ---
+        if self.selection == "2nd_best":
+            sorted_ops = sorted(names, key=lambda op: -avgs[op])
+            return sorted_ops[1] if len(sorted_ops) >= 2 else sorted_ops[0]
+
+        # --- ε-greedy : ε% random, sinon meilleur ---
+        if self.selection == "epsilon_greedy":
+            if random.random() < self.epsilon:
+                return random.choice(names)
+            return max(names, key=lambda op: avgs[op])
+
+        # --- Median : référence (même logique que adapted) ---
+        if self.selection == "median":
+            improving = [op for op in names if avgs[op] > 0]
+            if len(improving) >= 2:
+                improving.sort(key=lambda op: avgs[op])
+                return improving[len(improving) // 2]
+            if improving:
+                return improving[0]
+            return self._roulette(self._w_d)
+
+        return super()._select_destroy(current, it, destroy_ops, current_cost)
+
+
+# Self-test
+def _selftest():
+    print("alns_controls.py: import OK")
+    print("  Classes disponibles : ALNSControlled")
+    print("  Variantes : uniform, 2nd_best, epsilon_greedy, median")
+
+
+if __name__ == "__main__":
+    _selftest()
