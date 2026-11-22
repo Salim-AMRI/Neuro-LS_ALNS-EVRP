@@ -1,0 +1,94 @@
+# ============================================================
+# SETUP ABLATION
+# ============================================================
+import importlib, os, time
+import numpy as np
+import pandas as pd
+import alns_evrp
+importlib.reload(alns_evrp)
+
+from alns_evrp import (
+    ALNS, EVRPSimulator, parse_evrp_instance,
+    build_instances_dict, MAX_ITERATIONS_OVERRIDE, STAGNATION_LIMIT,
+    PUBLISHED_BKS, verify_solution,
+)
+
+# --- Config ablation ---
+INSTANCE        = "X-n351-k40"
+SEEDS           = [100, 200, 300, 400, 500]   # n=5 (extensible à 10)
+VARIANTS        = ["R1", "R2", "R2R3", "R1R2"]  # 4 nouvelles variantes
+# Note : baseline (n=20) et R1R2R3 (n=20) sont déjà faits
+OUTPUT_DIR      = "results_ablation"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("=" * 70)
+print("ABLATION SETUP")
+print("=" * 70)
+print(f"  Instance : {INSTANCE}")
+print(f"  Seeds    : {SEEDS} (n={len(SEEDS)})")
+print(f"  Variantes à exécuter : {VARIANTS}")
+print(f"  Déjà faites (n=20)    : baseline, R1R2R3")
+print(f"  Output    : {OUTPUT_DIR}/")
+print()
+
+# --- Charger instance ---
+instances = build_instances_dict([INSTANCE], "/content/")
+raw, bks = instances[INSTANCE]
+instance = parse_evrp_instance(raw, published_bks=bks, verbose=True)
+sim = EVRPSimulator(instance)
+max_it = MAX_ITERATIONS_OVERRIDE[INSTANCE]
+stag   = STAGNATION_LIMIT[INSTANCE]
+print(f"\n  max_it={max_it} | stag={stag} | BKS={bks}")
+
+# ============================================================
+# LANCEMENT ABLATION X-n351 (4 variantes × 5 seeds = 20 runs)
+# ============================================================
+
+CSV_PATH = os.path.join(OUTPUT_DIR, f"ablation_{INSTANCE}_n{len(SEEDS)}.csv")
+
+# Charger résultats existants (resume)
+if os.path.exists(CSV_PATH):
+    df_done = pd.read_csv(CSV_PATH)
+    done = set(zip(df_done["variant"], df_done["seed"]))
+    print(f"♻️  Reprise : {len(df_done)} runs déjà faits")
+else:
+    df_done = pd.DataFrame(columns=["instance", "variant", "seed",
+                                    "best_cost", "time_s"])
+    done = set()
+
+t_start_all = time.time()
+for variant in VARIANTS:
+    for seed in SEEDS:
+        if (variant, seed) in done:
+            print(f"⏭  {variant:6s} seed={seed:4d} (déjà fait)")
+            continue
+
+        print(f"\n--- {variant} | seed={seed} ---")
+        t0 = time.time()
+        try:
+            alns = ALNS(instance, sim,
+                        max_iterations=max_it,
+                        stagnation_limit=stag,
+                        seed=seed,
+                        verbose=False,
+                        use_rules=True,
+                        rules_variant=variant)
+            b, h, bt, tt, sol = alns.solve()
+
+            if sol:
+                ok, _, _ = verify_solution(instance, sim, sol)
+                if not ok: b = float('inf')
+
+            print(f"   best={b:.2f} | time={tt:.1f}s")
+            df_done = pd.concat([df_done, pd.DataFrame([{
+                "instance": INSTANCE, "variant": variant, "seed": seed,
+                "best_cost": b, "time_s": tt,
+            }])], ignore_index=True)
+            df_done.to_csv(CSV_PATH, index=False)
+        except Exception as e:
+            print(f"   ❌ Erreur : {e}")
+            import traceback; traceback.print_exc()
+
+elapsed = (time.time() - t_start_all) / 60
+print(f"\n✅ Terminé en {elapsed:.1f} min — {CSV_PATH}")
+print(df_done.groupby("variant")["best_cost"].agg(["count", "mean", "std", "min"]).round(2))
