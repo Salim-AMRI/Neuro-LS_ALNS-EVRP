@@ -1,0 +1,102 @@
+# ============================================================
+# CONTRÔLES CHEAP — 5 méthodes × 20 seeds sur X-n351
+# Protocole matched : H=20000, ls_prob=0, stagnation=None
+# Resumable : skip (method, seed) déjà faits
+# ============================================================
+import os, time
+import pandas as pd
+import numpy as np
+from alns_evrp import (
+    ALNS, EVRPSimulator, parse_evrp_instance, build_instances_dict,
+    verify_solution,
+)
+from alns_controls import ALNSControlled
+
+INSTANCE  = "X-n214-k11"
+SEEDS     = list(range(100, 2100, 100))
+H_EVALS   = 20000
+OUT_DIR   = "results_matched_X214"
+CSV_PATH  = os.path.join(OUT_DIR, "runs_matched.csv")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# --- Charger instance ---
+instances = build_instances_dict([INSTANCE], "/content/")
+raw, bks = instances[INSTANCE]
+instance = parse_evrp_instance(raw, published_bks=bks, verbose=False)
+sim = EVRPSimulator(instance)
+
+# --- 5 méthodes : (nom, fabrique) ---
+def make(method, seed):
+    if method == "baseline":
+        return ALNS(instance, sim, max_iterations=H_EVALS, seed=seed,
+                    use_rules=False, ls_prob=0.0, stagnation_limit=None,
+                    verbose=False)
+    if method == "adapted":
+        return ALNS(instance, sim, max_iterations=H_EVALS, seed=seed,
+                    use_rules=True, ls_prob=0.0, stagnation_limit=None,
+                    verbose=False)
+    if method == "uniform":
+        return ALNSControlled(instance, sim, max_iterations=H_EVALS, seed=seed,
+                              selection="uniform", ls_prob=0.0,
+                              stagnation_limit=None, verbose=False)
+    if method == "2nd_best":
+        return ALNSControlled(instance, sim, max_iterations=H_EVALS, seed=seed,
+                              selection="2nd_best", ls_prob=0.0,
+                              stagnation_limit=None, verbose=False)
+    if method == "epsilon_greedy":
+        return ALNSControlled(instance, sim, max_iterations=H_EVALS, seed=seed,
+                              selection="epsilon_greedy", epsilon=0.1,
+                              ls_prob=0.0, stagnation_limit=None, verbose=False)
+    raise ValueError(method)
+
+METHODS = ["baseline", "adapted", "uniform", "2nd_best", "epsilon_greedy"]
+
+# --- Resume ---
+if os.path.exists(CSV_PATH):
+    df = pd.read_csv(CSV_PATH)
+    done = set(zip(df["method"], df["seed"]))
+    print(f"♻️  Reprise : {len(df)} runs déjà faits")
+else:
+    df = pd.DataFrame(columns=["instance", "method", "seed",
+                                "best_cost", "feasible", "time_s"])
+    done = set()
+
+print(f"\n{'='*70}")
+print(f"CONTRÔLES X-n214 — n={len(SEEDS)} × {len(METHODS)} méthodes")
+print(f"  H_EVALS={H_EVALS} | ls_prob=0 | stagnation=None")
+print(f"  Estimation : ~{len(SEEDS)*len(METHODS)*3} min (~"
+      f"{len(SEEDS)*len(METHODS)*3/60:.1f} h)")
+print(f"{'='*70}\n")
+
+# --- Interleave méthodes par seed (résultats toujours appariables) ---
+t_start = time.time()
+for seed in SEEDS:
+    for method in METHODS:
+        if (method, seed) in done:
+            print(f"⏭  seed={seed:4d} {method:15s} (déjà fait)")
+            continue
+        try:
+            alns = make(method, seed)
+            b, h, bt, tt, sol = alns.solve()
+
+            ok = bool(sol) and bool(verify_solution(instance, sim, sol)[0])
+            print(f"  seed={seed:4d} {method:15s} best={b:.2f} "
+                  f"feasible={ok} time={tt:.1f}s")
+
+            df = pd.concat([df, pd.DataFrame([{
+                "instance": INSTANCE, "method": method, "seed": seed,
+                "best_cost": b if ok else np.nan,
+                "feasible": ok, "time_s": tt,
+            }])], ignore_index=True)
+            df.to_csv(CSV_PATH, index=False)
+        except Exception as e:
+            print(f"  ❌ seed={seed} {method} : {e}")
+            import traceback; traceback.print_exc()
+
+elapsed = (time.time() - t_start) / 60
+print(f"\n{'='*70}")
+print(f"✅ Terminé en {elapsed:.1f} min")
+print(f"{'='*70}")
+print(df.groupby("method")["best_cost"].agg(
+    ["count", "mean", "std", "min", "median"]).round(2))
+print(f"\n📁 {CSV_PATH}")
